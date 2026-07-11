@@ -11,7 +11,11 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/kagent-dev/kagent/go/adk/pkg/embedding"
+	"github.com/kagent-dev/kagent/go/adk/pkg/telemetry"
 	"github.com/kagent-dev/kagent/go/api/adk"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/adk/memory"
 	adkmodel "google.golang.org/adk/model"
 	adksession "google.golang.org/adk/session"
@@ -83,6 +87,10 @@ func New(cfg Config) (*KagentMemoryService, error) {
 // It extracts content from the session, optionally summarizes it, generates embeddings,
 // and stores it via the Kagent API.
 func (s *KagentMemoryService) AddSessionToMemory(ctx context.Context, session adksession.Session) error {
+	ctx, span := telemetry.StartMemorySpan(ctx, telemetry.SpanMemoryWrite,
+		telemetry.MemoryOperationSave, telemetry.MemoryScopeUser, s.agentName)
+	defer span.End()
+
 	log := logr.FromContextOrDiscard(ctx)
 	log.V(1).Info("Adding session to memory", "sessionID", session.ID(), "userID", session.UserID())
 
@@ -90,40 +98,54 @@ func (s *KagentMemoryService) AddSessionToMemory(ctx context.Context, session ad
 	rawContent := s.extractSessionContent(session)
 	if rawContent == "" {
 		log.V(1).Info("No content to add to memory", "sessionID", session.ID())
+		span.SetAttributes(attribute.Int(telemetry.AttrMemoryItemCount, 0))
 		return nil
 	}
 
-	// Summarize content if model is available
+	// Summarize content if model is available. Raw session text is stored as-is
+	// (source=user); LLM-summarized facts are stored as source=agent_inference.
 	contents := []string{rawContent}
+	source := telemetry.MemorySourceUser
 	if s.model != nil {
 		summarized, err := s.summarizeContent(ctx, rawContent)
 		if err != nil {
 			log.V(1).Info("Summarization failed, using raw content", "error", err)
 		} else if len(summarized) > 0 {
 			contents = summarized
+			source = telemetry.MemorySourceAgentInference
 			log.V(1).Info("Summarized content", "items", len(contents))
 		}
 	}
+	span.SetAttributes(attribute.String(telemetry.AttrMemorySource, source))
 
 	// Generate embeddings
 	embeddings, err := s.embeddingClient.Generate(ctx, contents)
 	if err != nil {
-		return fmt.Errorf("failed to generate embeddings: %w", err)
+		return s.recordSpanError(span, fmt.Errorf("failed to generate embeddings: %w", err))
 	}
 
 	if len(embeddings) != len(contents) {
-		return fmt.Errorf("embedding count mismatch: got %d, expected %d", len(embeddings), len(contents))
+		return s.recordSpanError(span, fmt.Errorf("embedding count mismatch: got %d, expected %d", len(embeddings), len(contents)))
 	}
 
 	// Store each content item with its embedding
 	for i, content := range contents {
 		if err := s.storeMemory(ctx, session.UserID(), content, embeddings[i]); err != nil {
-			return fmt.Errorf("failed to store memory %d: %w", i, err)
+			return s.recordSpanError(span, fmt.Errorf("failed to store memory %d: %w", i, err))
 		}
 	}
 
+	span.SetAttributes(attribute.Int(telemetry.AttrMemoryItemCount, len(contents)))
 	log.Info("Successfully added session to memory", "sessionID", session.ID(), "items", len(contents))
 	return nil
+}
+
+// recordSpanError marks span as failed, records err on it, and returns err so
+// callers can `return s.recordSpanError(span, err)` in a single line.
+func (s *KagentMemoryService) recordSpanError(span trace.Span, err error) error {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	return err
 }
 
 // storeMemory stores a single memory item via the Kagent API.
@@ -164,10 +186,17 @@ func (s *KagentMemoryService) storeMemory(ctx context.Context, userID, content s
 // SearchMemory implements memory.Service.SearchMemory.
 // It searches for relevant memories using vector similarity.
 func (s *KagentMemoryService) SearchMemory(ctx context.Context, req *memory.SearchRequest) (*memory.SearchResponse, error) {
+	// Recall runs before LLM dispatch, so this span attaches as a child of the
+	// active invoke_agent span when one is present in ctx.
+	ctx, span := telemetry.StartMemorySpan(ctx, telemetry.SpanMemoryRead,
+		telemetry.MemoryOperationPrefetch, telemetry.MemoryScopeUser, s.agentName)
+	defer span.End()
+
 	log := logr.FromContextOrDiscard(ctx)
 	log.V(1).Info("Searching memory", "query", req.Query, "userID", req.UserID)
 
 	if req.Query == "" {
+		setMemoryReadResult(span, 0)
 		return &memory.SearchResponse{Memories: []memory.Entry{}}, nil
 	}
 
@@ -176,6 +205,8 @@ func (s *KagentMemoryService) SearchMemory(ctx context.Context, req *memory.Sear
 	embeddings, err := s.embeddingClient.Generate(ctx, []string{req.Query})
 	if err != nil {
 		log.Error(err, "Failed to generate query embedding, returning empty results")
+		span.RecordError(err)
+		setMemoryReadResult(span, 0)
 		return &memory.SearchResponse{Memories: []memory.Entry{}}, nil
 	}
 	var vector []float32
@@ -183,6 +214,7 @@ func (s *KagentMemoryService) SearchMemory(ctx context.Context, req *memory.Sear
 		vector = embeddings[0]
 	}
 	if vector == nil {
+		setMemoryReadResult(span, 0)
 		return &memory.SearchResponse{Memories: []memory.Entry{}}, nil
 	}
 
@@ -197,31 +229,31 @@ func (s *KagentMemoryService) SearchMemory(ctx context.Context, req *memory.Sear
 
 	body, err := json.Marshal(searchReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, s.recordSpanError(span, fmt.Errorf("failed to marshal request: %w", err))
 	}
 
 	// Make HTTP request
 	url := fmt.Sprintf("%s/api/memories/search", s.apiURL)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, s.recordSpanError(span, fmt.Errorf("failed to create request: %w", err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %w", err)
+		return nil, s.recordSpanError(span, fmt.Errorf("failed to make request: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, s.recordSpanError(span, fmt.Errorf("API returned status %d", resp.StatusCode))
 	}
 
 	// Parse response
 	var results []searchResultItem
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, s.recordSpanError(span, fmt.Errorf("failed to decode response: %w", err))
 	}
 
 	// Convert to memory.Entry
@@ -238,16 +270,36 @@ func (s *KagentMemoryService) SearchMemory(ctx context.Context, req *memory.Sear
 		})
 	}
 
+	setMemoryReadResult(span, len(memories))
 	log.Info("Found memories", "count", len(memories), "query", req.Query)
 	return &memory.SearchResponse{Memories: memories}, nil
+}
+
+// setMemoryReadResult stamps the recall outcome onto a memory.read span: the number
+// of items returned and whether any memory passed the pgvector min-score gate
+// (injected) or all were filtered out (filtered).
+func setMemoryReadResult(span trace.Span, count int) {
+	injection := telemetry.MemoryInjectionFiltered
+	if count > 0 {
+		injection = telemetry.MemoryInjectionInjected
+	}
+	span.SetAttributes(
+		attribute.Int(telemetry.AttrMemoryItemCount, count),
+		attribute.String(telemetry.AttrMemoryInjectionResult, injection),
+	)
 }
 
 // summarizeContent uses the LLM to extract key facts from conversation content.
 // Returns a list of summarized facts, or the original content wrapped in a slice if summarization fails.
 func (s *KagentMemoryService) summarizeContent(ctx context.Context, content string) ([]string, error) {
+	ctx, span := telemetry.StartMemorySpan(ctx, telemetry.SpanMemoryConsolidate,
+		telemetry.MemoryOperationExtract, telemetry.MemoryScopeUser, s.agentName)
+	defer span.End()
+
 	log := logr.FromContextOrDiscard(ctx)
 
 	if content == "" {
+		span.SetAttributes(attribute.Int(telemetry.AttrMemoryItemCount, 0))
 		return nil, nil
 	}
 

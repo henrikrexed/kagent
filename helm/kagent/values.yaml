@@ -890,6 +890,12 @@ oauth2-proxy:
 # ==============================================================================
 
 otel:
+  # When tracing is enabled, the Go ADK emits dedicated memory.* spans alongside the
+  # existing gen_ai.* spans on invoke_agent:
+  #   memory.read        (operation=prefetch) - recall; child of invoke_agent
+  #   memory.write       (operation=save)     - session persisted to memory
+  #   memory.consolidate (operation=extract)  - LLM fact extraction before store
+  # See docs/observability/memory.md for the full attribute contract.
   tracing:
     enabled: false
     exporter:
