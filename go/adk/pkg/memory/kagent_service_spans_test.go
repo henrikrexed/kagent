@@ -121,6 +121,50 @@ func TestSearchMemory_EmitsReadSpan(t *testing.T) {
 	}
 }
 
+func TestSaveMemoryItem_EmitsWriteSpan(t *testing.T) {
+	sr := recordSpans(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	embClient, embServer := newMockEmbeddingClient(t)
+	defer embServer.Close()
+
+	svc := &KagentMemoryService{
+		agentName:       "test-agent",
+		apiURL:          server.URL,
+		client:          server.Client(),
+		ttlDays:         15,
+		embeddingClient: embClient,
+	}
+
+	if err := svc.SaveMemoryItem(context.Background(), "user1", "the secret code is BLUE-PANGOLIN-42"); err != nil {
+		t.Fatalf("SaveMemoryItem() error = %v", err)
+	}
+
+	span := spanByName(sr.Ended(), telemetry.SpanMemoryWrite)
+	if span == nil {
+		t.Fatalf("expected a %q span from the save_memory path", telemetry.SpanMemoryWrite)
+	}
+	assertAttr(t, span, telemetry.AttrMemoryOperation, telemetry.MemoryOperationSave)
+	// Explicit saves store content verbatim -> source=user, no summarization.
+	assertAttr(t, span, telemetry.AttrMemorySource, telemetry.MemorySourceUser)
+	assertAttr(t, span, telemetry.AttrMemoryScope, telemetry.MemoryScopeUser)
+	assertAttr(t, span, telemetry.AttrMemoryIndexRef, "test-agent")
+	assertAttr(t, span, telemetry.AttrMemorySUTStoreBackend, "pgvector")
+
+	if v, ok := attrValue(span, telemetry.AttrMemoryItemCount); !ok || v.AsInt64() != 1 {
+		t.Errorf("%s = %v (ok=%v), want 1", telemetry.AttrMemoryItemCount, v.AsInt64(), ok)
+	}
+
+	// The verbatim save path must NOT emit a consolidate span.
+	if c := spanByName(sr.Ended(), telemetry.SpanMemoryConsolidate); c != nil {
+		t.Errorf("save_memory path unexpectedly emitted a %q span", telemetry.SpanMemoryConsolidate)
+	}
+}
+
 func TestAddSessionToMemory_EmitsWriteSpan(t *testing.T) {
 	sr := recordSpans(t)
 

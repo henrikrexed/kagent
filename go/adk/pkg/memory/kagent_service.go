@@ -140,6 +140,42 @@ func (s *KagentMemoryService) AddSessionToMemory(ctx context.Context, session ad
 	return nil
 }
 
+// SaveMemoryItem stores a single user-provided content item as a first-class
+// memory write and emits a memory.write span. Unlike AddSessionToMemory it stores
+// the content verbatim (source=user) without LLM summarization, so it intentionally
+// emits no memory.consolidate span — consolidation is reserved for the summarizing
+// session-ingestion path. This is the path the save_memory tool drives, i.e. the
+// write an agent actually performs at runtime.
+func (s *KagentMemoryService) SaveMemoryItem(ctx context.Context, userID, content string) error {
+	ctx, span := telemetry.StartMemorySpan(ctx, telemetry.SpanMemoryWrite,
+		telemetry.MemoryOperationSave, telemetry.MemoryScopeUser, s.agentName)
+	defer span.End()
+	span.SetAttributes(attribute.String(telemetry.AttrMemorySource, telemetry.MemorySourceUser))
+
+	if content == "" {
+		return s.recordSpanError(span, fmt.Errorf("missing required parameter: content"))
+	}
+
+	embeddings, err := s.embeddingClient.Generate(ctx, []string{content})
+	if err != nil {
+		return s.recordSpanError(span, fmt.Errorf("failed to generate embedding: %w", err))
+	}
+	var vector []float32
+	if len(embeddings) > 0 {
+		vector = embeddings[0]
+	}
+	if vector == nil {
+		return s.recordSpanError(span, fmt.Errorf("embedding generation returned no vectors"))
+	}
+
+	if err := s.storeMemory(ctx, userID, content, vector); err != nil {
+		return s.recordSpanError(span, fmt.Errorf("failed to save memory: %w", err))
+	}
+
+	span.SetAttributes(attribute.Int(telemetry.AttrMemoryItemCount, 1))
+	return nil
+}
+
 // recordSpanError marks span as failed, records err on it, and returns err so
 // callers can `return s.recordSpanError(span, err)` in a single line.
 func (s *KagentMemoryService) recordSpanError(span trace.Span, err error) error {
