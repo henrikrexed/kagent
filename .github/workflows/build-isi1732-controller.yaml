@@ -1,0 +1,83 @@
+name: Build controller only (ISI-1732 DB spans)
+
+# Controller-ONLY build for ISI-1732 (pgvector DB-layer OTel spans in
+# go/core/internal/database/client_postgres.go). The change is confined to the
+# Go controller, so we do NOT rebuild app/golang-adk/acp-sandbox. Instead we PIN
+# the already-published isi1075-d1bed5f6 runtime digests and bake them into the
+# controller via scripts/controller-digest-ldflags.sh. This:
+#   * avoids the flaky golang-adk-full QEMU/apk path (which failed run 29409939798),
+#   * produces a controller whose baked runtime digests MATCH the agents already
+#     deployed on observable-kagent -> deploy is a pure controller-tag bump with
+#     ZERO agent-pod churn.
+# The controller image (go/Dockerfile) is chainguard-go -> distroless: no apk.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Controller image tag'
+        default: 'isi1732-b59aeb56'
+  push:
+    branches:
+      - ci/isi-1732-controller-only
+
+jobs:
+  build-controller-only:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKER_REGISTRY: ghcr.io
+      DOCKER_REPO: henrikrexed/kagent
+      VERSION: ${{ github.event.inputs.version || 'isi1732-b59aeb56' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          name: kagent-builder-v0.23.0
+          platforms: linux/amd64,linux/arm64
+          version: v0.23.0
+          use: 'true'
+
+      - name: Build and push controller (pinned runtime digests)
+        run: |
+          set -euxo pipefail
+          BASE=ghcr.io/henrikrexed/kagent
+          # Pinned already-published isi1075-d1bed5f6 runtime images. Public ones
+          # are pinned by digest (script short-circuits @sha256 refs, no network);
+          # the two private -full images are passed by tag and resolved via the
+          # authenticated `buildx imagetools inspect` fallback in the script.
+          DIGEST_LDFLAGS=$(CONTAINER_RUNTIME=docker \
+            APP_IMG=$BASE/app@sha256:1909b4c41762d636335c1e93c41b00fdcfc703bb15e1cddf46f1e03ad8ba446f \
+            APP_FULL_IMG=$BASE/app-full:isi1075-d1bed5f6 \
+            GOLANG_ADK_IMG=$BASE/golang-adk@sha256:b2700c6076417de7b2ad15a811f611ac61b06a19c7bbce371fe27c3bbc3d3baa \
+            GOLANG_ADK_FULL_IMG=$BASE/golang-adk-full:isi1075-d1bed5f6 \
+            ACP_SANDBOX_OPENCLAW_IMG=$BASE/acp-sandbox-openclaw@sha256:741aff090e357d44c21279261950f9a935caeb0ba4cbeb5ee506451ee4fa2578 \
+            ACP_SANDBOX_HERMES_IMG=$BASE/acp-sandbox-hermes@sha256:b184f8eb8b054a638b56cb51eb7e8c5757f8ddb0388ec30c9f05552404c4c86e \
+            ./scripts/controller-digest-ldflags.sh)
+          echo "DIGEST_LDFLAGS=${DIGEST_LDFLAGS}"
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          VER_PKG=github.com/kagent-dev/kagent/go/core/internal/version
+          LDFLAGS="-X ${VER_PKG}.Version=${VERSION} -X ${VER_PKG}.GitCommit=${GIT_COMMIT} -X ${VER_PKG}.BuildDate=${BUILD_DATE}"
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION=${VERSION} \
+            --build-arg LDFLAGS="${LDFLAGS}${DIGEST_LDFLAGS}" \
+            --build-arg BASE_IMAGE_REGISTRY=cgr.dev \
+            --build-arg BUILD_PACKAGE=core/cmd/controller/main.go \
+            -t ${BASE}/controller:${VERSION} -f go/Dockerfile ./go
+          echo "== pushed ${BASE}/controller:${VERSION} =="
+          docker buildx imagetools inspect ${BASE}/controller:${VERSION} || true
