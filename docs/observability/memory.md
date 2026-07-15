@@ -89,6 +89,39 @@ otel:
 The Go ADK is unaffected — it emits only deliberate high-level spans (no decorator
 auto-instrumentation), so this setting is a2a-Python-SDK-specific.
 
+## Trace signal-to-noise: httpx client + ASGI transport spans
+
+After the a2a SDK spans are disabled (above), the largest remaining source of low-value
+plumbing in a Python memory-agent trace is kagent's own auto-instrumentation of outbound
+HTTP calls. The Python runtime instruments every httpx client request (Ollama LLM, Ollama
+embedding, controller memory API) via `HTTPXClientInstrumentor` — roughly **65%** of the
+post-a2a trace is bare client `POST`/`GET` spans. These are redundant with the curated
+`gen_ai.*` / `memory.*` / `db.memory.*` spans, which already capture the same operations
+with richer attributes and operation-level timing, and their count scales with
+turns × tool-calls × embeddings.
+
+kagent disables httpx client instrumentation **by default**. The runtime
+(`kagent/core/tracing/_utils.py`) reads `OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED`
+(default `false`) and only activates `HTTPXClientInstrumentor` when it is `true`. The
+controller emits this env from the helm value
+[`otel.tracing.httpxClientInstrumentation`](../../helm/kagent/values.yaml) (default
+`false`) and forwards it to agent pods alongside the other `OTEL_*` vars. Set it to `true`
+to re-enable raw outbound transport/latency spans for deep debugging:
+
+```yaml
+otel:
+  tracing:
+    httpxClientInstrumentation: true  # default false
+```
+
+Separately, the FastAPI **server boundary** span (the valuable request entrypoint) is
+always kept, but the ASGI lifecycle sub-spans (`http send` / `http receive`) are dropped
+unconditionally via `exclude_spans=["receive", "send"]` — they carry no diagnostic value.
+
+Unlike the a2a toggle (helm-only, read by the third-party SDK), this is a change to
+kagent's own Python runtime code, so it ships in the agent image rather than purely in
+helm.
+
 ## Verifying live
 
 See [`docs/verification/kagent-after.dql`](../verification/kagent-after.dql) for a

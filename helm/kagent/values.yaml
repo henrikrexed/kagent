@@ -907,6 +907,18 @@ otel:
     # decorators into no-ops when false. Set to true to re-enable a2a SDK spans
     # for deep protocol/queue debugging.
     a2aSdkInstrumentation: false
+    # kagent's Python runtime auto-instruments every outbound httpx client call
+    # (Ollama LLM, Ollama embedding, controller memory API) via
+    # HTTPXClientInstrumentor. These client-transport spans are redundant with the
+    # curated gen_ai.* / memory.* / db.memory.* spans (which already carry
+    # operation-level timing and rich attributes) and their count scales with
+    # turns × tool-calls × embeddings — ~65% of a Python memory-agent trace after
+    # a2a is disabled. Disabled by default so agent traces stay focused; the
+    # runtime reads OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED (tracing/_utils.py).
+    # Set to true to re-enable raw outbound transport/latency spans for deep
+    # debugging. (The FastAPI server boundary span is always kept; only the ASGI
+    # "http send"/"http receive" lifecycle sub-spans are dropped unconditionally.)
+    httpxClientInstrumentation: false
     exporter:
       otlp:
         endpoint: ""

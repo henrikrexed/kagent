@@ -160,9 +160,29 @@ def configure(name: str = "kagent", namespace: str = "kagent", fastapi_app: Fast
         # check endpoint (high-frequency polling requests) and has little
         # diagnostic value.
         _excluded_urls = ".*/\\.well-known/agent-card\\.json"
-        HTTPXClientInstrumentor().instrument(excluded_urls=_excluded_urls)
+
+        # httpx client-transport spans (one per outbound Ollama/LLM/embedding/
+        # controller call) are redundant with the curated gen_ai.* / memory.* /
+        # db.memory.* spans, which already capture those operations with rich
+        # attributes. Their count scales with turns × tool-calls × embeddings, so
+        # they dominate agent traces with low-value plumbing. Disabled by default;
+        # gate via helm otel.tracing.httpxClientInstrumentation -> this env var.
+        # Flip to true for deep outbound transport/latency debugging.
+        httpx_client_enabled = os.getenv("OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED", "false").lower() == "true"
+        if httpx_client_enabled:
+            HTTPXClientInstrumentor().instrument(excluded_urls=_excluded_urls)
+        else:
+            logging.info("httpx client instrumentation disabled (OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED=false)")
+
         if fastapi_app:
-            FastAPIInstrumentor().instrument_app(fastapi_app, excluded_urls=_excluded_urls)
+            # Keep the FastAPI server boundary span (valuable request entrypoint)
+            # but drop the ASGI lifecycle sub-spans ("http send" / "http receive"),
+            # which add plumbing noise without diagnostic value.
+            FastAPIInstrumentor().instrument_app(
+                fastapi_app,
+                excluded_urls=_excluded_urls,
+                exclude_spans=["receive", "send"],
+            )
     # Configure logging if enabled
     if logging_enabled:
         logging.info("Enabling logging for GenAI events")
