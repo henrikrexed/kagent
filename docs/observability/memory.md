@@ -64,6 +64,31 @@ would mean fabricating values:
 When kagent gains a memory governance model, these can be emitted without changing the
 span names or the existing attribute contract.
 
+## Trace signal-to-noise: a2a SDK plumbing spans
+
+Python agents run on the a2a Python SDK, which auto-instruments its own internals
+(event-queue and request-handler plumbing) via `@trace_class` decorators. On a single
+Python memory-agent invocation this framework plumbing accounts for ~85% of the emitted
+spans, burying the high-value `gen_ai.*` / `memory.*` / `db.memory.*` / `invoke_agent`
+boundary spans.
+
+kagent disables this SDK-internal instrumentation **by default** so agent traces stay
+focused. The a2a SDK reads `OTEL_INSTRUMENTATION_A2A_SDK_ENABLED`
+(`a2a/utils/telemetry.py`, default `true`) and turns its decorators into no-ops when the
+value is `false`. The controller emits this env from the helm value
+[`otel.tracing.a2aSdkInstrumentation`](../../helm/kagent/values.yaml) (default `false`)
+and forwards it to agent pods alongside the other `OTEL_*` vars. Set it to `true` to
+re-enable a2a SDK spans for deep protocol/queue debugging:
+
+```yaml
+otel:
+  tracing:
+    a2aSdkInstrumentation: true  # default false
+```
+
+The Go ADK is unaffected — it emits only deliberate high-level spans (no decorator
+auto-instrumentation), so this setting is a2a-Python-SDK-specific.
+
 ## Verifying live
 
 See [`docs/verification/kagent-after.dql`](../verification/kagent-after.dql) for a

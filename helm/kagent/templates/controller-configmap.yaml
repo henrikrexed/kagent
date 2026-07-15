@@ -27,6 +27,10 @@ data:
   # OpenTelemetry Configuration
   OTEL_TRACING_ENABLED: {{ .Values.otel.tracing.enabled | quote }}
   OTEL_LOGGING_ENABLED: {{ .Values.otel.logging.enabled | quote }}
+  # Forwarded to agent pods (see collectOtelEnvFromProcess). Read by the a2a
+  # Python SDK to gate its @trace_class auto-instrumentation. Default false keeps
+  # a2a framework-plumbing spans out of agent traces; flip via otel.tracing.a2aSdkInstrumentation.
+  OTEL_INSTRUMENTATION_A2A_SDK_ENABLED: {{ .Values.otel.tracing.a2aSdkInstrumentation | default false | quote }}
   {{- $tracesEndpoint := .Values.otel.tracing.exporter.otlp.endpoint }}
   {{- $logsEndpoint := .Values.otel.logging.exporter.otlp.endpoint }}
   {{- if and $tracesEndpoint $logsEndpoint (eq $tracesEndpoint $logsEndpoint) }}
