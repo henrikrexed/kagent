@@ -12,11 +12,12 @@ on:
     inputs:
       version:
         description: 'Image tag/version'
-        default: 'isi1683-6906b5ee'
+        default: 'isi1075-d1bed5f6'
   push:
     branches:
       - ci/isi-1682-matched-pair
       - ci/isi-1683-memory-write-span
+      - ci/isi-1726-python-matched-pair
 
 jobs:
   build-matched-pair:
@@ -29,7 +30,7 @@ jobs:
       DOCKER_REPO: henrikrexed/kagent
       DOCKER_BUILD_ARGS: "--push --platform linux/amd64,linux/arm64"
       DOCKER_BUILDER: "docker buildx build"
-      VERSION: ${{ github.event.inputs.version || 'isi1683-6906b5ee' }}
+      VERSION: ${{ github.event.inputs.version || 'isi1075-d1bed5f6' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
