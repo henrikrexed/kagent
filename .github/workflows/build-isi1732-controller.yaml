@@ -56,15 +56,16 @@ jobs:
         run: |
           set -euxo pipefail
           BASE=ghcr.io/henrikrexed/kagent
-          # Pinned already-published isi1075-d1bed5f6 runtime images. Public ones
-          # are pinned by digest (script short-circuits @sha256 refs, no network);
-          # the two private -full images are passed by tag and resolved via the
-          # authenticated `buildx imagetools inspect` fallback in the script.
+          # Pin ALL runtime images by digest (the exact digests baked into the
+          # deployed isi1075-d1bed5f6 controller, from build run 29397093824). The
+          # ldflags script short-circuits @sha256 refs with no registry call, so no
+          # auth is needed -- the private -full packages cannot be read by the
+          # fork GITHUB_TOKEN, which is why tag-based resolution failed before.
           DIGEST_LDFLAGS=$(CONTAINER_RUNTIME=docker \
             APP_IMG=$BASE/app@sha256:1909b4c41762d636335c1e93c41b00fdcfc703bb15e1cddf46f1e03ad8ba446f \
-            APP_FULL_IMG=$BASE/app-full:isi1075-d1bed5f6 \
+            APP_FULL_IMG=$BASE/app-full@sha256:5112ecac36736faa82c18629dfeeefe54820e746ecb4aceaacffaeaadf467976 \
             GOLANG_ADK_IMG=$BASE/golang-adk@sha256:b2700c6076417de7b2ad15a811f611ac61b06a19c7bbce371fe27c3bbc3d3baa \
-            GOLANG_ADK_FULL_IMG=$BASE/golang-adk-full:isi1075-d1bed5f6 \
+            GOLANG_ADK_FULL_IMG=$BASE/golang-adk-full@sha256:ac757b622c5be9eba5c8f44dd29456dacfac061015c324cdd32e4ea2f2ffd2c5 \
             ACP_SANDBOX_OPENCLAW_IMG=$BASE/acp-sandbox-openclaw@sha256:741aff090e357d44c21279261950f9a935caeb0ba4cbeb5ee506451ee4fa2578 \
             ACP_SANDBOX_HERMES_IMG=$BASE/acp-sandbox-hermes@sha256:b184f8eb8b054a638b56cb51eb7e8c5757f8ddb0388ec30c9f05552404c4c86e \
             ./scripts/controller-digest-ldflags.sh)
