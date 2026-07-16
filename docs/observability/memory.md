@@ -18,6 +18,11 @@ The spans are produced by the Go ADK memory service
 | `memory.read` | `SearchMemory` (recall) | `prefetch` | the active `invoke_agent` span, when recall happens before LLM dispatch |
 | `memory.write` | `AddSessionToMemory` | `save` | current span in context |
 | `memory.consolidate` | `summarizeContent` (LLM fact extraction) | `extract` | its parent `memory.write` |
+| `memory.embed` | query/content vectorization | `embed` | the active `memory.read` / `memory.write` span |
+
+`memory.read`/`memory.write` time is dominated by vectorizing the query/content, not
+by the pgvector search or store. `memory.embed` breaks that out as an explicit child so
+the embed-vs-search/store split is visible instead of one opaque block.
 
 `memory.read` is started with the caller's context, so when recall runs before the
 model is invoked it attaches as a **child of `invoke_agent`**. This keeps the trace
@@ -44,6 +49,8 @@ Operation-specific attributes:
 | `memory.write` / `memory.consolidate` | `memory.item.count` | number of items stored / extracted |
 | `memory.read` | `memory.item.count` | number of memories returned |
 | `memory.read` | `memory.injection_result` | `injected` (≥1 memory passed the pgvector min-score gate) or `filtered` (none passed) |
+| `memory.read` | `memory.query.top_k` / `memory.query.min_score` | the pgvector search shape used (limit + min-score gate) |
+| `memory.embed` | `memory.item.count` | number of texts vectorized (1 for recall/save, N for batch session ingest) |
 
 ### Governance vocabulary and reserved attributes
 
@@ -64,63 +71,48 @@ would mean fabricating values:
 When kagent gains a memory governance model, these can be emitted without changing the
 span names or the existing attribute contract.
 
-## Trace signal-to-noise: a2a SDK plumbing spans
+## A2A (delegation) span attributes
 
-Python agents run on the a2a Python SDK, which auto-instruments its own internals
-(event-queue and request-handler plumbing) via `@trace_class` decorators. On a single
-Python memory-agent invocation this framework plumbing accounts for ~85% of the emitted
-spans, burying the high-value `gen_ai.*` / `memory.*` / `db.memory.*` / `invoke_agent`
-boundary spans.
+Cross-agent delegation is already wrapped by the ADK `execute_tool <subagent>` span.
+Rather than add a span layer, kagent stamps delegation attributes onto that active span so
+it reflects the actual call:
 
-kagent disables this SDK-internal instrumentation **by default** so agent traces stay
-focused. The a2a SDK reads `OTEL_INSTRUMENTATION_A2A_SDK_ENABLED`
-(`a2a/utils/telemetry.py`, default `true`) and turns its decorators into no-ops when the
-value is `false`. The controller emits this env from the helm value
-[`otel.tracing.a2aSdkInstrumentation`](../../helm/kagent/values.yaml) (default `false`)
-and forwards it to agent pods alongside the other `OTEL_*` vars. Set it to `true` to
-re-enable a2a SDK spans for deep protocol/queue debugging:
+| Attribute | Value |
+|-----------|-------|
+| `a2a.subagent.name` | the remote agent being delegated to |
+| `a2a.context_id` | the A2A context id used for the sub-agent session |
+| `a2a.parent_context_id` / `a2a.root_context_id` | conversation lineage (immediate caller / top-of-chain) |
+| `a2a.task.id` / `a2a.task.state` | the delegated task id and how it resolved (`completed` / `failed` / `input_required`) |
 
-```yaml
-otel:
-  tracing:
-    a2aSdkInstrumentation: true  # default false
-```
+## Trace verbosity: configurable auto-instrumentation
 
-The Go ADK is unaffected — it emits only deliberate high-level spans (no decorator
-auto-instrumentation), so this setting is a2a-Python-SDK-specific.
+kagent keeps the standard auto-instrumentation **enabled by default** (upstream parity),
+so agent traces carry the same detail they did before — including a2a SDK protocol/queue
+spans and outbound httpx client-transport spans. The httpx client spans also carry W3C
+trace context on the wire, keeping agent→controller and agent→agent hops stitched into a
+single trace.
 
-## Trace signal-to-noise: httpx client + ASGI transport spans
+For operators who want leaner, high-signal-only traces, both auto-instrumentations are
+**opt-out** via helm. Trace continuity is preserved even when disabled: the
+`_SubagentInterceptor` (A2A) and `inject_trace_context` (memory/session httpx) hooks carry
+the W3C correlation headers **without emitting spans**.
 
-After the a2a SDK spans are disabled (above), the largest remaining source of low-value
-plumbing in a Python memory-agent trace is kagent's own auto-instrumentation of outbound
-HTTP calls. The Python runtime instruments every httpx client request (Ollama LLM, Ollama
-embedding, controller memory API) via `HTTPXClientInstrumentor` — roughly **65%** of the
-post-a2a trace is bare client `POST`/`GET` spans. These are redundant with the curated
-`gen_ai.*` / `memory.*` / `db.memory.*` spans, which already capture the same operations
-with richer attributes and operation-level timing, and their count scales with
-turns × tool-calls × embeddings.
-
-kagent disables httpx client instrumentation **by default**. The runtime
-(`kagent/core/tracing/_utils.py`) reads `OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED`
-(default `false`) and only activates `HTTPXClientInstrumentor` when it is `true`. The
-controller emits this env from the helm value
-[`otel.tracing.httpxClientInstrumentation`](../../helm/kagent/values.yaml) (default
-`false`) and forwards it to agent pods alongside the other `OTEL_*` vars. Set it to `true`
-to re-enable raw outbound transport/latency spans for deep debugging:
+| Helm value | Env var (forwarded to agent pods) | Default | Set `false` to drop |
+|------------|-----------------------------------|---------|---------------------|
+| [`otel.tracing.a2aSdkInstrumentation`](../../helm/kagent/values.yaml) | `OTEL_INSTRUMENTATION_A2A_SDK_ENABLED` (`a2a/utils/telemetry.py`) | `true` | a2a SDK `@trace_class` plumbing spans (~85% of a Python trace) |
+| [`otel.tracing.httpxClientInstrumentation`](../../helm/kagent/values.yaml) | `OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED` (`kagent/core/tracing/_utils.py`) | `true` | raw outbound httpx `POST`/`GET` transport spans (~65% of a post-a2a trace) |
 
 ```yaml
 otel:
   tracing:
-    httpxClientInstrumentation: true  # default false
+    a2aSdkInstrumentation: false      # default true — drop a2a plumbing spans
+    httpxClientInstrumentation: false # default true — drop raw transport spans
 ```
 
-Separately, the FastAPI **server boundary** span (the valuable request entrypoint) is
-always kept, but the ASGI lifecycle sub-spans (`http send` / `http receive`) are dropped
-unconditionally via `exclude_spans=["receive", "send"]` — they carry no diagnostic value.
-
-Unlike the a2a toggle (helm-only, read by the third-party SDK), this is a change to
-kagent's own Python runtime code, so it ships in the agent image rather than purely in
-helm.
+The Go ADK emits only deliberate high-level spans (no decorator auto-instrumentation), so
+the a2a toggle is a2a-Python-SDK-specific. The FastAPI **server boundary** span is kept
+with the standard ASGI request spans; only the agent-card health-check endpoint is
+excluded (high-frequency polling, no diagnostic value).
 
 ## Verifying live
 

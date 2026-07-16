@@ -108,7 +108,8 @@ class KagentMemoryService(BaseMemoryService):
                 if not self._embedding_client:
                     logger.warning("No embedding client available for session %s", session.id)
                     return
-                vectors = await self._embedding_client.generate(valid_contents)
+                with mtel.start_embed_span(self.agent_name, len(valid_contents)):
+                    vectors = await self._embedding_client.generate(valid_contents)
                 if not vectors:
                     logger.warning("Failed to generate embeddings for session %s", session.id)
                     return
@@ -179,7 +180,8 @@ class KagentMemoryService(BaseMemoryService):
             if not self._embedding_client:
                 logger.warning("No embedding client available")
                 return
-            vector = await self._embedding_client.generate(content)
+            with mtel.start_embed_span(self.agent_name, 1):
+                vector = await self._embedding_client.generate(content)
             if not vector:
                 logger.warning("Failed to generate embedding for memory content")
                 return
@@ -225,15 +227,25 @@ class KagentMemoryService(BaseMemoryService):
         """
         # Recall runs before LLM dispatch, so this span attaches as a child of
         # the active invoke_agent span when one is present in context.
+        _search_limit = 5
+        _search_min_score = 0.3
         with mtel.start_memory_span(
             mtel.SPAN_MEMORY_READ, mtel.MEMORY_OPERATION_PREFETCH, mtel.MEMORY_SCOPE_USER, self.agent_name
         ) as span:
+            # Stamp the pgvector query shape so the read span reflects the actual
+            # search parameters, not just the outcome.
+            span.set_attribute(mtel.ATTR_MEMORY_QUERY_TOP_K, _search_limit)
+            span.set_attribute(mtel.ATTR_MEMORY_QUERY_MIN_SCORE, _search_min_score)
+
             # Generate embedding for the query
             if not self._embedding_client:
                 logger.warning("No embedding client available for search")
                 mtel.set_memory_read_result(span, 0)
                 return SearchMemoryResponse(memories=[])
-            vector = await self._embedding_client.generate(query)
+            # Vectorizing the query dominates recall latency; trace it as an
+            # explicit child so the embed-vs-search split is visible.
+            with mtel.start_embed_span(self.agent_name, 1):
+                vector = await self._embedding_client.generate(query)
             if not vector:
                 logger.warning("Failed to generate embedding for search query")
                 mtel.set_memory_read_result(span, 0)
@@ -243,8 +255,8 @@ class KagentMemoryService(BaseMemoryService):
                 "agent_name": self.agent_name,
                 "user_id": user_id,
                 "vector": vector,
-                "limit": 5,
-                "min_score": 0.3,
+                "limit": _search_limit,
+                "min_score": _search_min_score,
             }
 
             try:

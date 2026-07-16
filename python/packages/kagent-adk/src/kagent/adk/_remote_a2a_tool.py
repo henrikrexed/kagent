@@ -40,7 +40,6 @@ from a2a.types import (
 from a2a.types import (
     TransportProtocol as A2ATransport,
 )
-from opentelemetry.propagate import inject
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
@@ -53,6 +52,9 @@ from kagent.core.a2a import (
     KAGENT_HITL_DECISION_TYPE_REJECT,
     extract_hitl_info_from_task,
 )
+from opentelemetry.propagate import inject
+
+from . import _a2a_telemetry as a2atel
 
 logger = logging.getLogger("kagent_adk." + __name__)
 
@@ -341,6 +343,13 @@ class KAgentRemoteA2ATool(BaseTool):
         # to the same user as the parent agent session.
         call_context = self._build_call_context(tool_context)
 
+        # Reflect the delegation on the active ADK execute_tool span: which
+        # sub-agent, and the conversation lineage that keeps its session
+        # continuous.
+        a2atel.annotate_delegation_request(
+            self.name, self._last_context_id, self._build_lineage_headers(tool_context)
+        )
+
         task: Optional[Task] = None
         try:
             async for response in client.send_message(request=message, context=call_context):
@@ -359,6 +368,9 @@ class KAgentRemoteA2ATool(BaseTool):
             return f"Remote agent '{self.name}' returned no result."
 
         state = task.status.state if task.status else None
+
+        # Stamp how the delegated task resolved onto the active span.
+        a2atel.annotate_delegation_result(task.id, state.value if state else None)
 
         if state == TaskState.input_required:
             return self._handle_input_required(task, tool_context)

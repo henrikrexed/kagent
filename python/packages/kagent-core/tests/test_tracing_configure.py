@@ -124,24 +124,12 @@ def _stub_tracing_side_effects(monkeypatch, instrument_calls):
     monkeypatch.setattr(_utils.trace, "set_tracer_provider", lambda provider: None)
 
 
-def test_configure_httpx_client_instrumentation_disabled_by_default(monkeypatch):
-    """Redundant httpx client-transport spans must be off unless explicitly enabled."""
+def test_configure_httpx_client_instrumentation_enabled_by_default(monkeypatch):
+    """httpx client-transport spans are on by default (upstream parity); they
+    carry outbound-call timing and on-wire trace context."""
     monkeypatch.setenv("OTEL_TRACING_ENABLED", "true")
     monkeypatch.setenv("OTEL_LOGGING_ENABLED", "false")
     monkeypatch.delenv("OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED", raising=False)
-
-    instrument_calls = {}
-    _stub_tracing_side_effects(monkeypatch, instrument_calls)
-
-    _utils.configure(name="test", namespace="test")
-
-    assert "httpx_instrument_kwargs" not in instrument_calls
-
-
-def test_configure_httpx_client_instrumentation_enabled_via_env(monkeypatch):
-    monkeypatch.setenv("OTEL_TRACING_ENABLED", "true")
-    monkeypatch.setenv("OTEL_LOGGING_ENABLED", "false")
-    monkeypatch.setenv("OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED", "true")
 
     instrument_calls = {}
     _stub_tracing_side_effects(monkeypatch, instrument_calls)
@@ -152,9 +140,23 @@ def test_configure_httpx_client_instrumentation_enabled_via_env(monkeypatch):
     assert "excluded_urls" in instrument_calls["httpx_instrument_kwargs"]
 
 
-def test_configure_fastapi_drops_asgi_lifecycle_subspans(monkeypatch):
-    """The FastAPI server boundary span is kept, but the ASGI http send/receive
-    lifecycle sub-spans are dropped unconditionally."""
+def test_configure_httpx_client_instrumentation_opt_out_via_env(monkeypatch):
+    """Operators can opt out of the raw transport spans for leaner traces."""
+    monkeypatch.setenv("OTEL_TRACING_ENABLED", "true")
+    monkeypatch.setenv("OTEL_LOGGING_ENABLED", "false")
+    monkeypatch.setenv("OTEL_INSTRUMENTATION_HTTPX_CLIENT_ENABLED", "false")
+
+    instrument_calls = {}
+    _stub_tracing_side_effects(monkeypatch, instrument_calls)
+
+    _utils.configure(name="test", namespace="test")
+
+    assert "httpx_instrument_kwargs" not in instrument_calls
+
+
+def test_configure_fastapi_keeps_standard_asgi_spans(monkeypatch):
+    """FastAPI is instrumented with the standard ASGI spans (upstream parity);
+    only the agent-card health-check endpoint is excluded via excluded_urls."""
     monkeypatch.setenv("OTEL_TRACING_ENABLED", "true")
     monkeypatch.setenv("OTEL_LOGGING_ENABLED", "false")
 
@@ -164,7 +166,8 @@ def test_configure_fastapi_drops_asgi_lifecycle_subspans(monkeypatch):
     _utils.configure(name="test", namespace="test", fastapi_app=object())
 
     kwargs = instrument_calls["fastapi_instrument_kwargs"]
-    assert kwargs["exclude_spans"] == ["receive", "send"]
+    assert "exclude_spans" not in kwargs
+    assert "excluded_urls" in kwargs
 
 
 def test_otel_sdk_default_propagator_includes_w3c_tracecontext():

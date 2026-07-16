@@ -24,12 +24,14 @@ _TRACER = trace.get_tracer("kagent.adk.memory")
 SPAN_MEMORY_WRITE = "memory.write"
 SPAN_MEMORY_READ = "memory.read"
 SPAN_MEMORY_CONSOLIDATE = "memory.consolidate"
+SPAN_MEMORY_EMBED = "memory.embed"
 
 # memory.operation values. Aligned with the memory.* semantic-convention proposal.
 MEMORY_OPERATION_SAVE = "save"
 MEMORY_OPERATION_LOAD = "load"
 MEMORY_OPERATION_PREFETCH = "prefetch"
 MEMORY_OPERATION_EXTRACT = "extract"
+MEMORY_OPERATION_EMBED = "embed"
 
 # memory.scope values. kagent scopes memory by user within an agent namespace.
 MEMORY_SCOPE_USER = "user"
@@ -50,6 +52,11 @@ ATTR_MEMORY_SOURCE = "memory.source"
 ATTR_MEMORY_INDEX_REF = "memory.index_ref"
 ATTR_MEMORY_INJECTION_RESULT = "memory.injection_result"
 ATTR_MEMORY_ITEM_COUNT = "memory.item.count"
+
+# Recall query-shape attributes stamped on memory.read so the span reflects the
+# actual pgvector search parameters used (not just the outcome).
+ATTR_MEMORY_QUERY_TOP_K = "memory.query.top_k"
+ATTR_MEMORY_QUERY_MIN_SCORE = "memory.query.min_score"
 
 # SUT (system-under-test) descriptor attributes for the memory backend.
 ATTR_MEMORY_SUT_NAME = "memory.sut.name"
@@ -80,6 +87,27 @@ def start_memory_span(
             span.set_attribute(ATTR_MEMORY_SCOPE, scope)
         if index_ref:
             span.set_attribute(ATTR_MEMORY_INDEX_REF, index_ref)
+        yield span
+
+
+@contextmanager
+def start_embed_span(index_ref: str, item_count: int) -> Iterator[trace.Span]:
+    """Start a memory.embed child span around embedding generation.
+
+    Memory read/write time is dominated by vectorizing the query/content, not by
+    the pgvector search or store itself. Emitting this as an explicit child of
+    the active memory.* span makes that embed-vs-store/search split visible in
+    the trace (previously the read/write looked like one opaque block). Stamps
+    memory.operation=embed and the item count being embedded.
+    """
+    with _TRACER.start_as_current_span(SPAN_MEMORY_EMBED) as span:
+        span.set_attribute(ATTR_MEMORY_OPERATION, MEMORY_OPERATION_EMBED)
+        span.set_attribute(ATTR_MEMORY_SUT_NAME, "kagent")
+        span.set_attribute(ATTR_MEMORY_SUT_ARCHITECTURE, "vector")
+        span.set_attribute(ATTR_MEMORY_SUT_STORE_BACKEND, "pgvector")
+        if index_ref:
+            span.set_attribute(ATTR_MEMORY_INDEX_REF, index_ref)
+        span.set_attribute(ATTR_MEMORY_ITEM_COUNT, item_count)
         yield span
 
 

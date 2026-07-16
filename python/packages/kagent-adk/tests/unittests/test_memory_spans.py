@@ -95,3 +95,34 @@ async def test_search_memory_emits_read_span_filtered(exporter):
     assert span is not None
     assert span.attributes[mtel.ATTR_MEMORY_INJECTION_RESULT] == mtel.MEMORY_INJECTION_FILTERED
     assert span.attributes[mtel.ATTR_MEMORY_ITEM_COUNT] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_memory_emits_embed_child_and_query_attrs(exporter):
+    svc = _make_service()
+    svc.client.post = AsyncMock(return_value=_mock_response([{"id": "m1", "content": "fact"}]))
+
+    await svc.search_memory(app_name="app", user_id="u1", query="q")
+
+    # The query-vectorization step is now an explicit child of memory.read.
+    embed = _span_by_name(exporter, mtel.SPAN_MEMORY_EMBED)
+    assert embed is not None, "expected a memory.embed child span from the recall path"
+    assert embed.attributes[mtel.ATTR_MEMORY_OPERATION] == mtel.MEMORY_OPERATION_EMBED
+    assert embed.attributes[mtel.ATTR_MEMORY_ITEM_COUNT] == 1
+
+    # The read span carries the actual pgvector query shape.
+    read = _span_by_name(exporter, mtel.SPAN_MEMORY_READ)
+    assert read.attributes[mtel.ATTR_MEMORY_QUERY_TOP_K] == 5
+    assert read.attributes[mtel.ATTR_MEMORY_QUERY_MIN_SCORE] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_add_memory_emits_embed_child(exporter):
+    svc = _make_service()
+    svc.client.post = AsyncMock(return_value=_mock_response({"id": "m1"}))
+
+    await svc.add_memory(app_name="app", user_id="u1", content="remember this")
+
+    embed = _span_by_name(exporter, mtel.SPAN_MEMORY_EMBED)
+    assert embed is not None, "expected a memory.embed child span from the save path"
+    assert embed.attributes[mtel.ATTR_MEMORY_ITEM_COUNT] == 1
