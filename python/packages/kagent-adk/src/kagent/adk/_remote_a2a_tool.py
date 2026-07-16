@@ -40,6 +40,7 @@ from a2a.types import (
 from a2a.types import (
     TransportProtocol as A2ATransport,
 )
+from opentelemetry.propagate import inject
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
@@ -91,6 +92,18 @@ class _SubagentInterceptor(ClientCallInterceptor):
     async def intercept(self, method_name, request_payload, http_kwargs, agent_card, context):
         headers = dict(http_kwargs.get("headers", {}))
         headers[_SOURCE_HEADER] = _SOURCE_SUBAGENT
+
+        # Inject W3C trace context (traceparent/tracestate) so the remote agent
+        # CONTINUES this trace instead of starting a new root. This must live
+        # here — not in httpx/a2a-sdk auto-instrumentation — because both of
+        # those are disabled by default for span-noise reduction (ISI-1733 /
+        # ISI-1736), and disabling them silently dropped cross-agent trace
+        # propagation (ISI-1739). `inject()` reads the currently-active span
+        # context (the parent agent's invoke_agent/execute_tool span) via the
+        # global textmap propagator and writes only the correlation headers —
+        # it creates NO span, so trace continuity is restored without
+        # reintroducing the outbound client-span noise those changes removed.
+        inject(headers)
 
         if context:
             if _USER_ID_CONTEXT_KEY in context.state:
